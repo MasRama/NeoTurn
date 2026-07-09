@@ -19,6 +19,8 @@ Powered by `nodriver` — direct CDP to Chrome. No Playwright. No third-party AP
 
 ## ✨ Features
 
+- **Auto-detect sitekey** — just pass `--url`, NeoTurn finds the Turnstile sitekey automatically from the page HTML, inline scripts, or `/api/status` (New API sites). No manual sitekey lookup needed.
+- **Auto-handle existing widgets** — if the target page already has a Turnstile widget rendering, NeoTurn waits for it to solve naturally instead of injecting a new one.
 - **Single file, single dependency** — `neoturn.py` + `nodriver`. No Playwright, no Quart, no aiohttp, no Flask.
 - **Built-in HTTP API server** — raw asyncio, zero extra deps. Sync (`/solve`) and async (`/turnstile` + `/result`) modes.
 - **Auto Xvfb** — auto-starts a virtual display on Linux servers. No `xvfb-run` wrapper needed.
@@ -52,6 +54,16 @@ apt install xvfb
 
 ### CLI — Single solve
 
+**Auto-detect sitekey (recommended):**
+
+```bash
+python neoturn.py solve --url https://example.com
+```
+
+NeoTurn will navigate to the URL, detect the Turnstile sitekey from the page (HTML, inline scripts, or `/api/status` for New API sites), and solve the challenge.
+
+**Manual sitekey (override auto-detect):**
+
 ```bash
 python neoturn.py solve --url https://example.com --sitekey 0x4AAAAAAA...
 ```
@@ -65,8 +77,15 @@ Token is printed to **stdout** (pipe-friendly), logs go to **stderr**:
 Capture it cleanly:
 
 ```bash
-TOKEN=$(python neoturn.py solve --url https://example.com --sitekey 0x4AAAAAAA... 2>/dev/null)
+TOKEN=$(python neoturn.py solve --url https://example.com 2>/dev/null)
 echo "$TOKEN"
+```
+
+With `--verbose` or `--debug`, the detected sitekey is printed to stderr:
+
+```
+Elapsed: 8.002s
+Sitekey (auto-detected): 0x4AAAAAAAQSBic5b-QWaQ-E
 ```
 
 **Options:**
@@ -74,7 +93,7 @@ echo "$TOKEN"
 | Flag | Default | Description |
 |---|---|---|
 | `--url` | *(required)* | Target URL where Turnstile is embedded |
-| `--sitekey` | *(required)* | Turnstile sitekey (`0x4AAAA...`) |
+| `--sitekey` | `None` | Turnstile sitekey — **auto-detected from page if omitted** |
 | `--action` | `None` | Turnstile action parameter (optional) |
 | `--cdata` | `None` | Custom data parameter (optional) |
 | `--proxy` | `None` | Proxy server, e.g. `http://host:port` |
@@ -82,7 +101,7 @@ echo "$TOKEN"
 | `--retries` | `3` | Max retry attempts |
 | `--headless` | `False` | Run Chrome headless (Cloudflare may detect & block this) |
 | `--debug` | `False` | Debug logging |
-| `--verbose` | `False` | Print elapsed time to stderr |
+| `--verbose` | `False` | Print elapsed time + detected sitekey to stderr |
 
 ### Python library
 
@@ -117,29 +136,38 @@ python neoturn.py serve --port 5000
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/solve?url=...&sitekey=...` | GET | Synchronous solve — blocks until done, returns token |
-| `/turnstile?url=...&sitekey=...` | GET | Submit async task, returns `task_id` |
+| `/solve?url=...` | GET | Synchronous solve — blocks until done, returns token |
+| `/turnstile?url=...` | GET | Submit async task, returns `task_id` |
 | `/result?id=<task_id>` | GET | Poll for async task result |
 | `/health` | GET | Health check |
 | `/` | GET | API docs (HTML) |
 
-**Synchronous solve:**
+`sitekey` is optional on all solve endpoints — auto-detected from the target page if omitted.
+
+**Synchronous solve (auto-detect sitekey):**
+
+```bash
+curl "http://127.0.0.1:5000/solve?url=https://example.com"
+# {"status":"ok","token":"1.io9sk7GD5...","elapsed":8.0,"sitekey":"0x4AAAA...","auto_detected":true}
+```
+
+**Synchronous solve (manual sitekey):**
 
 ```bash
 curl "http://127.0.0.1:5000/solve?url=https://example.com&sitekey=0x4AAAAAAA..."
-# {"status":"ok","token":"1.io9sk7GD5...","elapsed":5.769}
+# {"status":"ok","token":"1.io9sk7GD5...","elapsed":5.769,"sitekey":"0x4AAAAAAA...","auto_detected":false}
 ```
 
 **Asynchronous solve (for batch processing):**
 
 ```bash
 # Submit
-curl "http://127.0.0.1:5000/turnstile?url=https://example.com&sitekey=0x4AAAAAAA..."
+curl "http://127.0.0.1:5000/turnstile?url=https://example.com"
 # {"task_id":"d2cbb257-9c37-4f9c-9bc7-1eaee72d96a8"}
 
 # Poll until done
 curl "http://127.0.0.1:5000/result?id=d2cbb257-9c37-4f9c-9bc7-1eaee72d96a8"
-# {"status":"ok","token":"1.io9sk7GD5...","elapsed":5.769}
+# {"status":"ok","token":"1.io9sk7GD5...","elapsed":8.0,"sitekey":"0x4AAAA...","auto_detected":true}
 ```
 
 **Server options:**
@@ -183,21 +211,22 @@ Full register flow (OTP → register → login → token creation) takes ~25-30s
 
 1. **Launch Chrome** via nodriver (direct CDP, no Playwright injection points)
 2. **Navigate to target URL** — sets the correct browser origin so Turnstile accepts the sitekey
-3. **Inject Turnstile widget** — dynamically loads `challenges.cloudflare.com/turnstile/v0/api.js` and renders the widget
-4. **Poll for token** — checks `cf-turnstile-response` hidden input, `turnstile.getResponse()`, and widget data attributes
-5. **Return token** — valid `cf-turnstile-response` string ready for form submission
+3. **Auto-detect sitekey** — scans the page for `data-sitekey` attributes, inline `turnstile.render()` calls, and `/api/status` (New API sites). If the page already has a Turnstile widget rendering, NeoTurn waits for it to solve naturally.
+4. **Inject Turnstile widget** (if no existing widget) — dynamically loads `challenges.cloudflare.com/turnstile/v0/api.js` and renders the widget with the detected sitekey
+5. **Poll for token** — checks `cf-turnstile-response` hidden input, `turnstile.getResponse()`, and widget data attributes
+6. **Return token** — valid `cf-turnstile-response` string ready for form submission
 
 **Why not headless?** Cloudflare Turnstile collects 55+ browser signals (WebGL, canvas, audio, fonts, screen, navigator, React state) and runs them through ML scoring. Headless Chrome is missing key signals and gets blocked. NeoTurn uses non-headless Chrome with auto-started Xvfb on Linux.
 
 ## ⚖️ Comparison
 
-| Project | Backend | Deps | Headless | API Server | Auto-Xvfb |
-|---|---|---|---|---|---|
-| **NeoTurn** | nodriver (CDP) | **1** | Xvfb auto | Built-in (zero deps) | ✅ |
-| Theyka/Turnstile-Solver | patchright (Playwright) | 4+ | Manual `xvfb-run` | Quart | ❌ |
-| taozhiyu/Turnstile-Solver | Camoufox | 3+ | Manual | Quart | ❌ |
-| EzSolver | nodriver | 1 | Xvfb manual | aiohttp | ❌ |
-| odell0111/turnstile_solver | patchright | 3+ | Manual | aiohttp | ❌ |
+| Project | Backend | Deps | Auto-Detect Sitekey | Headless | API Server | Auto-Xvfb |
+|---|---|---|---|---|---|---|
+| **NeoTurn** | nodriver (CDP) | **1** | ✅ HTML + JS + `/api/status` | Xvfb auto | Built-in (zero deps) | ✅ |
+| Theyka/Turnstile-Solver | patchright (Playwright) | 4+ | ❌ manual | Manual `xvfb-run` | Quart | ❌ |
+| taozhiyu/Turnstile-Solver | Camoufox | 3+ | ❌ manual | Manual | Quart | ❌ |
+| EzSolver | nodriver | 1 | ❌ manual | Xvfb manual | aiohttp | ❌ |
+| odell0111/turnstile_solver | patchright | 3+ | ❌ manual | Manual | aiohttp | ❌ |
 
 ## ⚠️ Limitations
 

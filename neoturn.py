@@ -196,29 +196,111 @@ class NeoTurnSolver:
                 return str(dv.value)
         return None
 
+    # JavaScript to detect sitekey + existing widget state from a loaded page.
+    # Returns JSON string with: sitekey, hasWidget, hasScript, action, cdata
+    DETECT_JS = r"""
+    (function() {
+        var result = {sitekey: null, hasWidget: false, hasScript: false, action: null, cdata: null};
+
+        // 1. Check for existing Turnstile widget (data-sitekey attribute)
+        var widget = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey]');
+        if (widget) {
+            result.hasWidget = true;
+            result.sitekey = widget.getAttribute('data-sitekey');
+            result.action = widget.getAttribute('data-action') || null;
+            result.cdata = widget.getAttribute('data-cdata') || null;
+        }
+
+        // 2. Check for turnstile.render() calls with sitekey in inline scripts
+        if (!result.sitekey) {
+            var scripts = document.querySelectorAll('script:not([src])');
+            for (var s of scripts) {
+                var text = s.textContent || '';
+                // Match sitekey: "0x4AAAA..." or sitekey: '0x4AAAA...'
+                var m = text.match(/sitekey['"]?\s*[:=]\s*['"]?(0x[0-9A-Za-z_\-]{20,})['"]?/i);
+                if (m) {
+                    result.sitekey = m[1];
+                    break;
+                }
+            }
+        }
+
+        // 3. Check for Turnstile script already loaded
+        var cfScript = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"]');
+        if (cfScript) {
+            result.hasScript = true;
+        }
+
+        // 4. Check window.turnstile (script loaded and executed)
+        if (typeof window.turnstile !== 'undefined') {
+            result.hasScript = true;
+        }
+
+        // 5. Fallback: scan full HTML for sitekey pattern
+        if (!result.sitekey) {
+            var html = document.documentElement.outerHTML;
+            var m = html.match(/(0x[0-9A-Za-z_\-]{20,})/);
+            if (m) result.sitekey = m[1];
+        }
+
+        return JSON.stringify(result);
+    })();
+    """
+
+    async def _detect_sitekey(self, tab) -> dict:
+        """Detect Turnstile sitekey and widget state from the loaded page.
+
+        Returns:
+            {"sitekey": str|None, "hasWidget": bool, "hasScript": bool,
+             "action": str|None, "cdata": str|None}
+        """
+        try:
+            result = await tab.evaluate(self.DETECT_JS, return_by_value=True)
+            text = self._extract_value(result)
+            if text:
+                return json.loads(text)
+        except Exception as e:
+            logger.debug(f"Sitekey detection error: {e}")
+        return {"sitekey": None, "hasWidget": False, "hasScript": False, "action": None, "cdata": None}
+
     async def solve(
         self,
         url: str,
-        sitekey: str,
+        sitekey: Optional[str] = None,
         action: Optional[str] = None,
         cdata: Optional[str] = None,
     ) -> dict:
         """Solve a Turnstile challenge and return the token.
 
+        If sitekey is None, NeoTurn will auto-detect it from the target page.
+        If the page already has a Turnstile widget, NeoTurn will wait for it
+        to solve naturally instead of injecting a new one.
+
         Returns:
-            {"token": str, "elapsed": float, "success": bool, "error": Optional[str]}
+            {"token": str, "elapsed": float, "success": bool, "error": Optional[str],
+             "sitekey": str, "auto_detected": bool}
         """
         start = time.time()
         last_error = None
+        detected_sitekey = sitekey
+        auto_detected = False
 
         for attempt in range(1, self.max_retries + 1):
-            logger.debug(f"Attempt {attempt}/{self.max_retries} for {url} sitekey={sitekey[:12]}...")
+            sk_label = detected_sitekey[:12] + "..." if detected_sitekey else "auto-detect"
+            logger.debug(f"Attempt {attempt}/{self.max_retries} for {url} sitekey={sk_label}")
             try:
-                token = await self._solve_once(url, sitekey, action, cdata)
+                token, sk, was_auto = await self._solve_once(url, detected_sitekey, action, cdata)
                 if token:
                     elapsed = round(time.time() - start, 3)
                     log_success(f"Solved in {elapsed}s — token={token[:20]}...")
-                    return {"token": token, "elapsed": elapsed, "success": True, "error": None}
+                    return {
+                        "token": token, "elapsed": elapsed, "success": True,
+                        "error": None, "sitekey": sk, "auto_detected": was_auto,
+                    }
+                # If auto-detect happened, cache it for retries
+                if sk and not detected_sitekey:
+                    detected_sitekey = sk
+                    auto_detected = True
             except Exception as e:
                 last_error = str(e)
                 logger.warning(f"Attempt {attempt} failed: {e}")
@@ -226,16 +308,22 @@ class NeoTurnSolver:
 
         elapsed = round(time.time() - start, 3)
         logger.error(f"All {self.max_retries} attempts failed in {elapsed}s")
-        return {"token": None, "elapsed": elapsed, "success": False, "error": last_error}
+        return {
+            "token": None, "elapsed": elapsed, "success": False,
+            "error": last_error, "sitekey": detected_sitekey, "auto_detected": auto_detected,
+        }
 
     async def _solve_once(
         self,
         url: str,
-        sitekey: str,
+        sitekey: Optional[str],
         action: Optional[str],
         cdata: Optional[str],
-    ) -> Optional[str]:
-        """Single solve attempt — launches browser, injects widget, extracts token."""
+    ) -> tuple:
+        """Single solve attempt.
+
+        Returns: (token, detected_sitekey, was_auto_detected)
+        """
         browser = None
         try:
             browser_args = self._build_browser_args()
@@ -255,15 +343,60 @@ class NeoTurnSolver:
 
             try:
                 tab = await browser.get(url_normalized)
-                await tab.sleep(2)
+                await tab.sleep(3)
             except Exception as e:
                 logger.debug(f"Navigation to target URL failed ({e}), using about:blank")
                 tab = await browser.get("about:blank")
                 await tab.sleep(1)
 
-            # Inject Turnstile script + widget div via JavaScript.
-            # We clear the page and inject our own widget. The Turnstile script
-            # loads dynamically and renders the challenge iframe.
+            # Auto-detect sitekey and widget state from the page.
+            # SPA apps (React/Vue) may render the widget after JS executes,
+            # so we retry detection a few times with short waits.
+            detected = {"sitekey": None, "hasWidget": False, "hasScript": False, "action": None, "cdata": None}
+            for detect_attempt in range(4):
+                detected = await self._detect_sitekey(tab)
+                if detected.get("sitekey"):
+                    break
+                # Fallback: try /api/status (New API sites expose turnstile_site_key there)
+                if detect_attempt == 1:
+                    try:
+                        status_js = """
+                        (function() {
+                            return fetch('/api/status').then(r => r.json()).then(d => {
+                                if (d && d.data && d.data.turnstile_site_key) return d.data.turnstile_site_key;
+                                return null;
+                            }).catch(() => null);
+                        })();
+                        """
+                        sk_result = await tab.evaluate(status_js, await_promise=True, return_by_value=True)
+                        sk = self._extract_value(sk_result)
+                        if sk and sk.startswith("0x"):
+                            detected["sitekey"] = sk
+                            logger.debug(f"Sitekey from /api/status: {sk}")
+                            break
+                    except Exception:
+                        pass
+                await tab.sleep(1)
+
+            effective_sitekey = sitekey or detected.get("sitekey")
+            was_auto = bool(sitekey is None and detected.get("sitekey"))
+
+            if was_auto and effective_sitekey:
+                logger.info(f"Auto-detected sitekey: {effective_sitekey}")
+            elif not effective_sitekey:
+                logger.error("No sitekey found. Pass --sitekey manually or ensure the page has a Turnstile widget.")
+                return None, None, False
+
+            # If the page already has a Turnstile widget rendering, just wait for the token
+            if detected.get("hasWidget") and detected.get("hasScript"):
+                logger.debug("Page already has Turnstile widget — waiting for natural solve")
+                # Use detected action/cdata if not overridden
+                eff_action = action or detected.get("action")
+                eff_cdata = cdata or detected.get("cdata")
+                token = await self._poll_for_token(tab)
+                return token, effective_sitekey, was_auto
+
+            # No existing widget — inject our own
             action_js = f"widget.setAttribute('data-action', '{action}');" if action else ""
             cdata_js = f"widget.setAttribute('data-cdata', '{cdata}');" if cdata else ""
             inject_js = f"""
@@ -279,7 +412,7 @@ class NeoTurnSolver:
                 document.body.appendChild(container);
                 var widget = document.createElement('div');
                 widget.className = 'cf-turnstile';
-                widget.setAttribute('data-sitekey', '{sitekey}');
+                widget.setAttribute('data-sitekey', '{effective_sitekey}');
                 {action_js}
                 {cdata_js}
                 container.appendChild(widget);
@@ -291,14 +424,14 @@ class NeoTurnSolver:
             }})();
             """
             await tab.evaluate(inject_js)
-            logger.debug("Injected Turnstile widget via JS")
+            logger.debug(f"Injected Turnstile widget (sitekey={effective_sitekey[:12]}...)")
 
             # Wait for the Turnstile script to load and initialize
             await asyncio.sleep(3)
 
             # Poll for the token
             token = await self._poll_for_token(tab)
-            return token
+            return token, effective_sitekey, was_auto
 
         finally:
             if browser:
@@ -451,9 +584,9 @@ class NeoTurnAPI:
 
     async def _handle_turnstile_async(self, writer, params):
         url = params.get("url")
-        sitekey = params.get("sitekey")
-        if not url or not sitekey:
-            await self._send_json(writer, 400, {"error": "Both 'url' and 'sitekey' are required"})
+        sitekey = params.get("sitekey")  # optional — auto-detected if absent
+        if not url:
+            await self._send_json(writer, 400, {"error": "'url' is required"})
             return
 
         task_id = str(uuid.uuid4())
@@ -466,7 +599,8 @@ class NeoTurnAPI:
             self.results[task_id] = {"status": "done", **result}
 
         self.tasks[task_id] = asyncio.create_task(run_task())
-        logger.info(f"Task {task_id[:8]} submitted — url={url} sitekey={sitekey[:12]}...")
+        sk_label = sitekey[:12] + "..." if sitekey else "auto-detect"
+        logger.info(f"Task {task_id[:8]} submitted — url={url} sitekey={sk_label}")
         await self._send_json(writer, 202, {"task_id": task_id})
 
     async def _handle_get_result(self, writer, params):
@@ -482,35 +616,42 @@ class NeoTurnAPI:
                 "status": "ok",
                 "token": result["token"],
                 "elapsed": result["elapsed"],
+                "sitekey": result.get("sitekey"),
+                "auto_detected": result.get("auto_detected", False),
             })
         else:
             await self._send_json(writer, 422, {
                 "status": "failed",
                 "error": result.get("error", "unknown"),
                 "elapsed": result.get("elapsed", 0),
+                "sitekey": result.get("sitekey"),
             })
 
     async def _handle_solve_sync(self, writer, params):
         url = params.get("url")
-        sitekey = params.get("sitekey")
-        if not url or not sitekey:
-            await self._send_json(writer, 400, {"error": "Both 'url' and 'sitekey' are required"})
+        sitekey = params.get("sitekey")  # optional — auto-detected if absent
+        if not url:
+            await self._send_json(writer, 400, {"error": "'url' is required"})
             return
         action = params.get("action")
         cdata = params.get("cdata")
-        logger.info(f"Sync solve — url={url} sitekey={sitekey[:12]}...")
+        sk_label = sitekey[:12] + "..." if sitekey else "auto-detect"
+        logger.info(f"Sync solve — url={url} sitekey={sk_label}")
         result = await self.solver.solve(url, sitekey, action, cdata)
         if result["success"]:
             await self._send_json(writer, 200, {
                 "status": "ok",
                 "token": result["token"],
                 "elapsed": result["elapsed"],
+                "sitekey": result.get("sitekey"),
+                "auto_detected": result.get("auto_detected", False),
             })
         else:
             await self._send_json(writer, 422, {
                 "status": "failed",
                 "error": result.get("error", "unknown"),
                 "elapsed": result.get("elapsed", 0),
+                "sitekey": result.get("sitekey"),
             })
 
     async def _send_json(self, writer, status: int, data: dict):
@@ -548,11 +689,11 @@ h1{color:#00ff88}code{background:#1a1a1a;padding:2px 6px;border-radius:3px;color
 </head><body>
 <h1>NeoTurn API</h1>
 <p>Lightweight Cloudflare Turnstile Solver — nodriver + real Chrome</p>
-<div class="endpoint"><code>GET /turnstile?url=...&sitekey=...</code><br>Submit async solve task, returns task_id</div>
+<div class="endpoint"><code>GET /turnstile?url=...&sitekey=...</code><br>Submit async solve task, returns task_id<br><small>sitekey optional — auto-detected from page if omitted</small></div>
 <div class="endpoint"><code>GET /result?id=task_id</code><br>Poll for result</div>
-<div class="endpoint"><code>GET /solve?url=...&sitekey=...</code><br>Synchronous solve (blocks until done)</div>
+<div class="endpoint"><code>GET /solve?url=...&sitekey=...</code><br>Synchronous solve (blocks until done)<br><small>sitekey optional — auto-detected from page if omitted</small></div>
 <div class="endpoint"><code>GET /health</code><br>Health check</div>
-<p style="margin-top:30px;color:#666">No browser automation framework. No third-party API. Just Chrome + CDP.</p>
+<p style="margin-top:30px;color:#666">No browser automation framework. No third-party API. Just Chrome + CDP.<br>Auto-detects sitekey from target page. Handles existing widgets naturally.</p>
 </body></html>"""
 
 
@@ -576,11 +717,18 @@ def cmd_solve(args):
         cleanup_xvfb()
     if result["success"]:
         print(f"\n{result['token']}")
-        if args.verbose:
+        if args.verbose or args.debug:
             print(f"\nElapsed: {result['elapsed']}s", file=sys.stderr)
+            sk = result.get("sitekey")
+            if sk:
+                tag = "auto-detected" if result.get("auto_detected") else "manual"
+                print(f"Sitekey ({tag}): {sk}", file=sys.stderr)
         sys.exit(0)
     else:
         print(f"FAILED: {result['error']}", file=sys.stderr)
+        sk = result.get("sitekey")
+        if sk and args.debug:
+            print(f"Sitekey used: {sk}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -613,7 +761,7 @@ def main():
     # solve subcommand
     p_solve = sub.add_parser("solve", help="Solve a single Turnstile challenge")
     p_solve.add_argument("--url", required=True, help="Target URL")
-    p_solve.add_argument("--sitekey", required=True, help="Turnstile sitekey")
+    p_solve.add_argument("--sitekey", default=None, help="Turnstile sitekey (auto-detected from page if omitted)")
     p_solve.add_argument("--action", default=None, help="Turnstile action (optional)")
     p_solve.add_argument("--cdata", default=None, help="Custom data (optional)")
     p_solve.add_argument("--proxy", default=None, help="Proxy server (e.g. http://host:port)")
